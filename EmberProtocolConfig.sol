@@ -1,0 +1,699 @@
+/*
+  Copyright (c) 2026 Ember Protocol Inc.
+  Proprietary Smart Contract License – All Rights Reserved.
+
+  This source code is provided for transparency and verification only.
+  Use, modification, reproduction, or redeployment of this code 
+  requires prior written permission from the Ember Protocol Inc.
+*/
+
+pragma solidity ^0.8.22;
+
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "./interfaces/IAtomicLiquidity.sol";
+import "./interfaces/IEmberProtocolConfig.sol";
+import "./interfaces/IEmberVault.sol";
+import "./interfaces/IEmberVaultValidator.sol";
+
+/// @title Ember Protocol Configuration
+/// @notice Stores configuration parameters that govern the vault system and manages vault admin operations
+contract EmberProtocolConfig is
+  Initializable,
+  UUPSUpgradeable,
+  OwnableUpgradeable,
+  ReentrancyGuardUpgradeable,
+  IEmberProtocolConfig
+{
+  // Constants
+  uint256 public constant MIN_RATE = 250_000_000_000_000_000;
+  uint256 public constant MAX_RATE = 5_000_000_000_000_000_000;
+  uint256 public constant DEFAULT_RATE = 1_000_000_000_000_000_000;
+  uint256 public constant MIN_RATE_INTERVAL = 60 * 60 * 1000; // 1 hour in milliseconds
+  uint256 public constant MAX_RATE_INTERVAL = 24 * 60 * 60 * 1000; // 1 day in milliseconds
+  uint256 public constant MAX_FEE_PERCENTAGE = 100_000_000_000_000_000;
+  /// @dev L-5: hard ceiling on withdrawal fees (50%, in 1e18 fixed-point), enforced both
+  ///      individually and combined (permanent + time-based). The prior `< 1e18` bound only
+  ///      prevented the net-payout underflow, so a confiscatory 99% withdrawal fee was settable.
+  uint256 public constant MAX_WITHDRAWAL_FEE_PERCENTAGE = 500_000_000_000_000_000;
+
+  // Structs
+  struct ProtocolConfig {
+    bool pause;
+    address platformFeeRecipient;
+    uint256 minRate;
+    uint256 maxRate;
+    uint256 defaultRate;
+    uint256 minRateInterval;
+    uint256 maxRateInterval;
+    uint256 maxFeePercentage;
+  }
+
+  // State variables
+  ProtocolConfig public protocolConfig;
+
+  /// @notice list of all blacklisted addresses
+  mapping(address => bool) public blacklistedAccounts;
+
+  /// @notice Emergency-response role with a narrow surface (blacklist + pause).
+  ///         Settable by `setGuardian` (onlyOwner). When set to address(0)
+  ///         the guardian-gated functions are unreachable.
+  address public guardian;
+
+  /**
+   * @dev Reserved storage gap for future upgrades.
+   * This allows adding new state variables without shifting storage slots.
+   * See: https://docs.openzeppelin.com/upgrades-plugins/1.x/writing-upgradeable#storage-gaps
+   */
+  uint256[49] private __gap;
+
+  // Events are inherited from IEmberProtocolConfig
+
+  /// @notice Restricts a function to the configured guardian. If `guardian`
+  ///         is address(0) (unset), this naturally rejects all callers.
+  modifier onlyGuardian() {
+    if (msg.sender != guardian) revert Unauthorized();
+    _;
+  }
+
+  /// @custom:oz-upgrades-unsafe-allow constructor
+  constructor() {
+    _disableInitializers();
+  }
+
+  /// @param _platformFeeRecipient Recipient for all platform fees
+  /**
+   * @dev Initialize function replaces constructor for upgradeable contracts
+   * @param initialOwner Address of the contract owner
+   * @param _platformFeeRecipient Recipient for all platform fees
+   */
+  function initialize(address initialOwner, address _platformFeeRecipient) public initializer {
+    __Ownable_init(initialOwner);
+    __UUPSUpgradeable_init();
+    __ReentrancyGuard_init();
+
+    if (_platformFeeRecipient == address(0)) revert ZeroAddress();
+
+    protocolConfig = ProtocolConfig({
+      pause: false,
+      platformFeeRecipient: _platformFeeRecipient,
+      minRate: MIN_RATE,
+      maxRate: MAX_RATE,
+      defaultRate: DEFAULT_RATE,
+      minRateInterval: MIN_RATE_INTERVAL,
+      maxRateInterval: MAX_RATE_INTERVAL,
+      maxFeePercentage: MAX_FEE_PERCENTAGE
+    });
+  }
+
+  /// @notice Pauses or unpauses non-admin operations
+  /// @param pauseFlag True to pause, false to resume
+  function pauseNonAdminOperations(bool pauseFlag) external nonReentrant onlyOwner {
+    if (pauseFlag == protocolConfig.pause) revert SameValue();
+    protocolConfig.pause = pauseFlag;
+    emit PauseNonAdminOperations(pauseFlag);
+  }
+
+  /// @notice Updates where platform fees are sent
+  function updatePlatformFeeRecipient(address recipient) external nonReentrant onlyOwner {
+    if (recipient == address(0)) revert ZeroAddress();
+    if (recipient == protocolConfig.platformFeeRecipient) revert SameValue();
+    address previous = protocolConfig.platformFeeRecipient;
+    protocolConfig.platformFeeRecipient = recipient;
+    emit PlatformFeeRecipientUpdated(previous, recipient);
+  }
+
+  /// @notice Updates the minimum allowable rate
+  function updateMinRate(uint256 minRate_) external nonReentrant onlyOwner {
+    if (minRate_ == 0 || minRate_ > protocolConfig.maxRate || minRate_ > protocolConfig.defaultRate)
+      revert InvalidRate();
+    if (minRate_ == protocolConfig.minRate) revert SameValue();
+    uint256 previous = protocolConfig.minRate;
+    protocolConfig.minRate = minRate_;
+    emit MinRateUpdated(previous, minRate_);
+  }
+
+  /// @notice Updates the maximum allowable rate
+  function updateMaxRate(uint256 maxRate_) external nonReentrant onlyOwner {
+    if (maxRate_ < protocolConfig.minRate || maxRate_ < protocolConfig.defaultRate)
+      revert InvalidRate();
+    if (maxRate_ == protocolConfig.maxRate) revert SameValue();
+    uint256 previous = protocolConfig.maxRate;
+    protocolConfig.maxRate = maxRate_;
+    emit MaxRateUpdated(previous, maxRate_);
+  }
+
+  /// @notice Updates the default rate applied to new vaults
+  function updateDefaultRate(uint256 defaultRate_) external nonReentrant onlyOwner {
+    if (defaultRate_ < protocolConfig.minRate || defaultRate_ > protocolConfig.maxRate)
+      revert InvalidRate();
+    if (defaultRate_ == protocolConfig.defaultRate) revert SameValue();
+    uint256 previous = protocolConfig.defaultRate;
+    protocolConfig.defaultRate = defaultRate_;
+    emit DefaultRateUpdated(previous, defaultRate_);
+  }
+
+  /// @notice Updates the maximum fee percentage
+  function updateMaxFeePercentage(uint256 maxFeePercentage_) external nonReentrant onlyOwner {
+    if (maxFeePercentage_ > MAX_FEE_PERCENTAGE) revert InvalidFeePercentage();
+    if (maxFeePercentage_ == protocolConfig.maxFeePercentage) revert SameValue();
+    uint256 previous = protocolConfig.maxFeePercentage;
+    protocolConfig.maxFeePercentage = maxFeePercentage_;
+    emit MaxAllowedFeePercentageUpdated(previous, maxFeePercentage_);
+  }
+
+  /// @notice Updates the minimum interval for rate changes
+  /// @dev Lower-bounded by the protocol-level MIN_RATE_INTERVAL constant (1 hour) so the
+  ///      configurable floor cannot fall below the policy default.
+  function updateMinRateInterval(uint256 minRateInterval_) external nonReentrant onlyOwner {
+    if (minRateInterval_ < MIN_RATE_INTERVAL || minRateInterval_ > protocolConfig.maxRateInterval)
+      revert InvalidInterval();
+    if (minRateInterval_ == protocolConfig.minRateInterval) revert SameValue();
+    uint256 previous = protocolConfig.minRateInterval;
+    protocolConfig.minRateInterval = minRateInterval_;
+    emit MinRateIntervalUpdated(previous, minRateInterval_);
+  }
+
+  /// @notice Updates the maximum interval for rate changes
+  function updateMaxRateInterval(uint256 maxRateInterval_) external nonReentrant onlyOwner {
+    if (maxRateInterval_ < protocolConfig.minRateInterval || maxRateInterval_ > MAX_RATE_INTERVAL)
+      revert InvalidInterval();
+    if (maxRateInterval_ == protocolConfig.maxRateInterval) revert SameValue();
+    uint256 previous = protocolConfig.maxRateInterval;
+    protocolConfig.maxRateInterval = maxRateInterval_;
+    emit MaxRateIntervalUpdated(previous, maxRateInterval_);
+  }
+
+  /// @notice Adds or removes an account from the blacklist
+  function setBlacklistedAccount(
+    address account,
+    bool blacklisted
+  ) external nonReentrant onlyOwner {
+    if (account == address(0)) revert ZeroAddress();
+    if (blacklistedAccounts[account] == blacklisted) revert SameValue();
+    blacklistedAccounts[account] = blacklisted;
+    emit BlacklistedAccountUpdated(account, blacklisted);
+  }
+
+  // ============================================
+  // Guardian Functions
+  // ============================================
+
+  /// @notice Sets the guardian address. Pass address(0) to disable
+  ///         guardian-gated functions entirely.
+  function setGuardian(address newGuardian) external nonReentrant onlyOwner {
+    if (newGuardian == guardian) revert SameValue();
+    address previous = guardian;
+    guardian = newGuardian;
+    emit GuardianUpdated(previous, newGuardian);
+  }
+
+  /// @notice Guardian fast-path for `pauseNonAdminOperations`. Behaves
+  ///         identically to the owner version but is callable without
+  ///         going through the timelock.
+  function guardianPauseNonAdminOperations(bool pauseFlag) external nonReentrant onlyGuardian {
+    if (pauseFlag == protocolConfig.pause) revert SameValue();
+    protocolConfig.pause = pauseFlag;
+    emit PauseNonAdminOperations(pauseFlag);
+  }
+
+  /// @notice Guardian fast-path for `setBlacklistedAccount`. Behaves
+  ///         identically to the owner version but is callable without
+  ///         going through the timelock.
+  function guardianSetBlacklistedAccount(
+    address account,
+    bool blacklisted
+  ) external nonReentrant onlyGuardian {
+    if (account == address(0)) revert ZeroAddress();
+    if (blacklistedAccounts[account] == blacklisted) revert SameValue();
+    blacklistedAccounts[account] = blacklisted;
+    emit BlacklistedAccountUpdated(account, blacklisted);
+  }
+
+  // ============================================
+  // Vault Admin Functions
+  // ============================================
+  // These functions validate parameters then forward to the vault with the original caller.
+  // The vault verifies the caller has the required role (admin/owner).
+
+  /// @notice Updates the max TVL of a vault
+  /// @dev Validates parameters, then forwards to vault which verifies caller is admin
+  /// @param vault The vault address
+  /// @param newMaxTVL The new maximum total value locked
+  function updateVaultMaxTVL(address vault, uint256 newMaxTVL) external nonReentrant {
+    if (newMaxTVL == 0) revert InvalidValue();
+    if (newMaxTVL == IEmberVault(vault).maxTVL()) revert SameValue();
+
+    uint256 currentTVL = IEmberVault(vault).totalAssets();
+    if (currentTVL > newMaxTVL) revert InvalidValue();
+
+    IEmberVault(vault).setMaxTVL(msg.sender, newMaxTVL);
+  }
+
+  /// @notice Changes the vault rate update interval
+  /// @dev Validates parameters, then forwards to vault which verifies caller is admin
+  /// @param vault The vault address
+  /// @param newInterval The new rate update interval (in milliseconds)
+  function updateVaultRateUpdateInterval(address vault, uint256 newInterval) external nonReentrant {
+    if (
+      newInterval < protocolConfig.minRateInterval || newInterval > protocolConfig.maxRateInterval
+    ) revert InvalidInterval();
+    if (newInterval == IEmberVault(vault).rate().rateUpdateInterval) revert SameValue();
+
+    IEmberVault(vault).setRateUpdateInterval(msg.sender, newInterval);
+  }
+
+  /// @notice Changes the vault max rate change per update
+  /// @dev Validates parameters, then forwards to vault which verifies caller is admin
+  /// @param vault The vault address
+  /// @param newMaxRateChangePerUpdate The new max rate change allowed per update (1e18 = 100%)
+  function updateVaultMaxRateChangePerUpdate(
+    address vault,
+    uint256 newMaxRateChangePerUpdate
+  ) external nonReentrant {
+    if (newMaxRateChangePerUpdate == 0) revert InvalidRate();
+    if (newMaxRateChangePerUpdate == IEmberVault(vault).rate().maxRateChangePerUpdate)
+      revert SameValue();
+
+    IEmberVault(vault).setMaxRateChangePerUpdate(msg.sender, newMaxRateChangePerUpdate);
+  }
+
+  /// @notice Changes the vault admin
+  /// @dev Validates parameters, then forwards to vault which verifies caller is owner
+  /// @param vault The vault address
+  /// @param newAdmin The new admin address
+  function updateVaultAdmin(address vault, address newAdmin) external nonReentrant {
+    if (newAdmin == address(0)) revert ZeroAddress();
+
+    IEmberVault.Roles memory vaultRoles = IEmberVault(vault).roles();
+    if (newAdmin == vaultRoles.admin) revert SameValue();
+    if (newAdmin == vaultRoles.rateManager || newAdmin == vaultRoles.operator)
+      revert InvalidValue();
+    if (IEmberVault(vault).subAccounts(newAdmin)) revert InvalidValue();
+    if (blacklistedAccounts[newAdmin]) revert Blacklisted();
+
+    IEmberVault(vault).setAdmin(msg.sender, newAdmin);
+  }
+
+  /// @notice Changes the vault operator
+  /// @dev Validates parameters, then forwards to vault which verifies caller is admin
+  /// @param vault The vault address
+  /// @param newOperator The new operator address
+  function updateVaultOperator(address vault, address newOperator) external nonReentrant {
+    if (newOperator == address(0)) revert ZeroAddress();
+
+    IEmberVault.Roles memory vaultRoles = IEmberVault(vault).roles();
+    if (newOperator == vaultRoles.operator) revert SameValue();
+    if (newOperator == vaultRoles.rateManager || newOperator == vaultRoles.admin)
+      revert InvalidValue();
+    if (IEmberVault(vault).subAccounts(newOperator)) revert InvalidValue();
+    if (blacklistedAccounts[newOperator]) revert Blacklisted();
+
+    IEmberVault(vault).setOperator(msg.sender, newOperator);
+  }
+
+  /// @notice Updates the address of the vault rate manager
+  /// @dev Validates parameters, then forwards to vault which verifies caller is admin
+  /// @param vault The vault address
+  /// @param newRateManager The new rate manager address
+  function updateVaultRateManager(address vault, address newRateManager) external nonReentrant {
+    if (newRateManager == address(0)) revert ZeroAddress();
+
+    IEmberVault.Roles memory vaultRoles = IEmberVault(vault).roles();
+    if (newRateManager == vaultRoles.rateManager) revert SameValue();
+    if (newRateManager == vaultRoles.admin || newRateManager == vaultRoles.operator)
+      revert InvalidValue();
+    if (IEmberVault(vault).subAccounts(newRateManager)) revert InvalidValue();
+    if (blacklistedAccounts[newRateManager]) revert Blacklisted();
+
+    IEmberVault(vault).setRateManager(msg.sender, newRateManager);
+  }
+
+  /// @notice Updates the vault fee percentage
+  /// @dev Validates parameters, then forwards to vault which verifies caller is admin
+  /// @param vault The vault address
+  /// @param newFeePercentage The new fee percentage
+  function updateVaultFeePercentage(address vault, uint256 newFeePercentage) external nonReentrant {
+    if (newFeePercentage > protocolConfig.maxFeePercentage) {
+      revert InvalidFeePercentage();
+    }
+    if (newFeePercentage == IEmberVault(vault).platformFee().platformFeePercentage) {
+      revert SameValue();
+    }
+    IEmberVault(vault).setFeePercentage(msg.sender, newFeePercentage);
+  }
+
+  /// @notice Updates the vault name
+  /// @dev Validates parameters, then forwards to vault which verifies caller is admin
+  /// @param vault The vault address
+  /// @param newName The new vault name
+  function updateVaultName(address vault, string calldata newName) external nonReentrant {
+    if (bytes(newName).length == 0) revert InvalidValue();
+
+    IEmberVault(vault).setVaultName(msg.sender, newName);
+  }
+
+  /// @notice Updates the minimum withdrawable shares
+  /// @dev Validates parameters, then forwards to vault which verifies caller is admin
+  /// @param vault The vault address
+  /// @param newMinWithdrawableShares The new minimum withdrawable shares amount
+  function updateVaultMinWithdrawableShares(
+    address vault,
+    uint256 newMinWithdrawableShares
+  ) external nonReentrant {
+    if (newMinWithdrawableShares == 0) revert InvalidValue();
+    if (newMinWithdrawableShares == IEmberVault(vault).minWithdrawableShares()) revert SameValue();
+
+    IEmberVault(vault).setMinWithdrawableShares(msg.sender, newMinWithdrawableShares);
+  }
+
+  /// @notice Sets or removes a sub-account for a vault
+  /// @dev Validates parameters, then forwards to vault which verifies caller is admin
+  /// @param vault The vault address
+  /// @param account The account address to set or remove
+  /// @param isSubAccount True to add as sub-account, false to remove
+  function setVaultSubAccount(
+    address vault,
+    address account,
+    bool isSubAccount
+  ) external nonReentrant {
+    if (account == address(0)) revert ZeroAddress();
+
+    if (isSubAccount) {
+      // Adding sub-account
+      if (IEmberVault(vault).subAccounts(account)) revert SameValue();
+
+      // Check it's not a role
+      IEmberVault.Roles memory vaultRoles = IEmberVault(vault).roles();
+      if (
+        account == vaultRoles.admin ||
+        account == vaultRoles.operator ||
+        account == vaultRoles.rateManager
+      ) revert InvalidValue();
+
+      // Check it's not blacklisted
+      if (blacklistedAccounts[account]) revert Blacklisted();
+    } else {
+      // Removing sub-account
+      if (!IEmberVault(vault).subAccounts(account)) revert InvalidValue();
+    }
+
+    IEmberVault(vault).setSubAccountStatus(msg.sender, account, isSubAccount);
+  }
+
+  /// @notice Sets the pause status for a specific operation on a vault
+  /// @dev Gated by the protocol guardian (not vault admin) so emergency pause
+  ///      stays instant even after the vault admin role is moved behind the
+  ///      timelock. The vault itself only checks `onlyProtocolConfig` — the
+  ///      authorization is enforced here.
+  /// @param vault The vault address
+  /// @param operation The operation to pause/unpause: "deposits", "withdrawals", or "privilegedOperations"
+  /// @param paused True to pause, false to unpause
+  function setVaultPausedStatus(
+    address vault,
+    string calldata operation,
+    bool paused
+  ) external nonReentrant onlyGuardian {
+    IEmberVault(vault).setPausedStatus(msg.sender, operation, paused);
+  }
+
+  /// @notice Sets the bridge adapter for a vault's cross-chain operations
+  /// @dev Validates parameters, then forwards to vault which verifies caller is admin
+  /// @param vault The vault address
+  /// @param newAdapter The new bridge adapter address (can be zero to disable)
+  function setVaultBridgeAdapter(address vault, address newAdapter) external nonReentrant {
+    // No validation needed - adapter can be any address or zero to disable
+    // Vault will verify caller is admin
+    IEmberVault(vault).setBridgeAdapter(msg.sender, newAdapter);
+  }
+
+  /// @notice Sets the bridge amount limits for a vault
+  /// @dev Validates parameters, then forwards to vault which verifies caller is admin
+  /// @param vault The vault address
+  /// @param minAmount The minimum bridge amount (0 = no minimum)
+  /// @param maxAmount The maximum bridge amount (0 = no maximum)
+  function setVaultBridgeLimits(
+    address vault,
+    uint256 minAmount,
+    uint256 maxAmount
+  ) external nonReentrant {
+    if (
+      minAmount == IEmberVault(vault).minBridgeAmount() &&
+      maxAmount == IEmberVault(vault).maxBridgeAmount()
+    ) revert SameValue();
+    if (maxAmount > 0 && minAmount > maxAmount) revert InvalidValue();
+
+    IEmberVault(vault).setBridgeLimits(msg.sender, minAmount, maxAmount);
+  }
+
+  // ============================================
+  // Withdrawal Fee & Deposit Allow List Functions (via Validator)
+  // ============================================
+
+  /// @notice Sets the vault validator contract address for a vault
+  function setVaultValidator(address vault, address validator) external nonReentrant {
+    IEmberVault(vault).setVaultValidator(msg.sender, validator);
+  }
+
+  /// @notice Sets (or clears) the deposit parking lot for a vault
+  /// @dev Forwards to vault which verifies caller is the vault admin. Passing
+  ///      address(0) disables the parking-lot gate and restores permissionless
+  ///      deposits.
+  /// @param vault The vault address
+  /// @param newParkingLot The parking lot address, or address(0) to disable gating
+  function setVaultParkingLot(address vault, address newParkingLot) external nonReentrant {
+    IEmberVault(vault).setParkingLot(msg.sender, newParkingLot);
+  }
+
+  function setVaultDepositAllowList(
+    address vault,
+    address user,
+    bool status
+  ) external nonReentrant {
+    if (user == address(0)) revert ZeroAddress();
+    IEmberVaultValidator validator = IEmberVault(vault).vaultValidator();
+    if (validator.depositAllowList(vault, user) == status) revert SameValue();
+
+    if (status) {
+      IEmberVault.Roles memory vaultRoles = IEmberVault(vault).roles();
+      if (user == vaultRoles.admin || user == vaultRoles.operator || user == vaultRoles.rateManager)
+        revert InvalidValue();
+      if (blacklistedAccounts[user]) revert Blacklisted();
+    }
+
+    validator.setDepositAllowListStatus(msg.sender, vault, user, status);
+  }
+
+  function setVaultFeeExemptionList(
+    address vault,
+    address user,
+    bool status
+  ) external nonReentrant {
+    if (user == address(0)) revert ZeroAddress();
+    IEmberVaultValidator validator = IEmberVault(vault).vaultValidator();
+    if (validator.feeExemptAccounts(vault, user) == status) revert SameValue();
+
+    if (status) {
+      IEmberVault.Roles memory vaultRoles = IEmberVault(vault).roles();
+      if (user == vaultRoles.admin || user == vaultRoles.operator || user == vaultRoles.rateManager)
+        revert InvalidValue();
+      if (blacklistedAccounts[user]) revert Blacklisted();
+    }
+
+    validator.setFeeExemptionListStatus(msg.sender, vault, user, status);
+  }
+
+  function updateVaultPermanentFeePercentage(
+    address vault,
+    uint256 newPercentage
+  ) external nonReentrant {
+    IEmberVaultValidator validator = IEmberVault(vault).vaultValidator();
+    IEmberVaultValidator.WithdrawalFee memory fee = validator.withdrawalFee(vault);
+    if (newPercentage == fee.permanentFeePercentage) revert SameValue();
+    // L-5: cap the sum of permanent + time-based at 50% (not merely < 100%) so withdrawal
+    // fees can't be set confiscatorily. Also keeps the net-payout subtraction from underflowing.
+    // Strictly dominates an individual `newPercentage > MAX` check (fee.timeBasedFeePercentage
+    // is already ≤ MAX by the same invariant applied on its own setter).
+    if (newPercentage + fee.timeBasedFeePercentage > MAX_WITHDRAWAL_FEE_PERCENTAGE)
+      revert InvalidValue();
+    validator.setPermanentFeePercentage(msg.sender, vault, newPercentage);
+  }
+
+  function updateVaultTimeBasedFeePercentage(
+    address vault,
+    uint256 newPercentage
+  ) external nonReentrant {
+    IEmberVaultValidator validator = IEmberVault(vault).vaultValidator();
+    IEmberVaultValidator.WithdrawalFee memory fee = validator.withdrawalFee(vault);
+    if (newPercentage == fee.timeBasedFeePercentage) revert SameValue();
+    // L-5: 50% joint cap with permanent fee — see updateVaultPermanentFeePercentage.
+    if (newPercentage + fee.permanentFeePercentage > MAX_WITHDRAWAL_FEE_PERCENTAGE)
+      revert InvalidValue();
+    validator.setTimeBasedFeePercentage(msg.sender, vault, newPercentage);
+  }
+
+  function updateVaultTimeBasedFeeThreshold(
+    address vault,
+    uint256 newThreshold
+  ) external nonReentrant {
+    IEmberVaultValidator validator = IEmberVault(vault).vaultValidator();
+    if (newThreshold == validator.withdrawalFee(vault).timeBasedFeeThreshold) revert SameValue();
+    validator.setTimeBasedFeeThreshold(msg.sender, vault, newThreshold);
+  }
+
+  // ============================================
+  // Atomic Liquidity Vault Forwarders
+  // ============================================
+  // AtomicLiquidity's admin setters are gated by `onlyProtocolConfig` and forward the
+  // original caller back to the vault for role validation. These functions are the
+  // only entry points that can reach those setters on-chain.
+
+  /// @notice Sets (or clears) the external ERC-4626 strategy on an atomic vault.
+  function setVaultStrategy(address vault, address newStrategy) external nonReentrant {
+    IAtomicLiquidity(vault).setStrategy(msg.sender, newStrategy);
+  }
+
+  /// @notice Sets the cumulative cap (in shares) for instantWithdraw redemptions.
+  function setVaultMaxInstantWithdrawShares(address vault, uint256 newMax) external nonReentrant {
+    IAtomicLiquidity(vault).setMaxInstantWithdrawShares(msg.sender, newMax);
+  }
+
+  /// @notice Sets the fee percentage charged on instant withdrawals (1e18 = 100%).
+  function setVaultInstantWithdrawFeePercentage(
+    address vault,
+    uint256 newFeePercentage
+  ) external nonReentrant {
+    IAtomicLiquidity(vault).setInstantWithdrawFeePercentage(msg.sender, newFeePercentage);
+  }
+
+  /// @notice Whitelists (or de-lists) an EmberVault share for the cross-vault instant swap.
+  function setVaultEmberShareWhitelist(
+    address vault,
+    address share,
+    bool whitelisted,
+    uint256 feePercentage,
+    uint256 maxCapacityPercentage,
+    uint256 holdbackPercentage,
+    uint256 maxUtilizationPercentage,
+    uint256 minSwapGross,
+    uint256 maxHeldValueAbsolute
+  ) external nonReentrant {
+    IAtomicLiquidity(vault).setEmberShareWhitelist(
+      msg.sender,
+      share,
+      whitelisted,
+      feePercentage,
+      maxCapacityPercentage,
+      holdbackPercentage,
+      maxUtilizationPercentage,
+      minSwapGross,
+      maxHeldValueAbsolute
+    );
+  }
+
+  /// @notice Sets per-address fee and holdback waivers for the EmberShare cross-vault swap.
+  function setVaultSwapWaiver(
+    address vault,
+    address account,
+    bool feeWaived,
+    bool holdbackWaived
+  ) external nonReentrant {
+    IAtomicLiquidity(vault).setSwapWaiver(msg.sender, account, feeWaived, holdbackWaived);
+  }
+
+  /// @notice Adds, updates, or removes a fee-multiplier curve tier for an EmberShare.
+  function updateVaultEmberShareFeeMultiplierTier(
+    address vault,
+    address share,
+    uint256 threshold,
+    uint256 multiplier,
+    bool remove
+  ) external nonReentrant {
+    IAtomicLiquidity(vault).updateEmberShareFeeMultiplierTier(
+      msg.sender,
+      share,
+      threshold,
+      multiplier,
+      remove
+    );
+  }
+
+  // ============================================
+  // Getter Functions
+  // ============================================
+
+  /// @notice Returns whether the protocol is paused for non-admins
+  function getProtocolPauseStatus() external view returns (bool) {
+    return protocolConfig.pause;
+  }
+
+  /// @notice Returns the current platform fee recipient
+  function getPlatformFeeRecipient() external view returns (address) {
+    return protocolConfig.platformFeeRecipient;
+  }
+
+  function getMinRate() external view returns (uint256) {
+    return protocolConfig.minRate;
+  }
+
+  function getMaxRate() external view returns (uint256) {
+    return protocolConfig.maxRate;
+  }
+
+  function getDefaultRate() external view returns (uint256) {
+    return protocolConfig.defaultRate;
+  }
+
+  function getMinRateInterval() external view returns (uint256) {
+    return protocolConfig.minRateInterval;
+  }
+
+  function getMaxRateInterval() external view returns (uint256) {
+    return protocolConfig.maxRateInterval;
+  }
+
+  function getMaxAllowedFeePercentage() external view returns (uint256) {
+    return protocolConfig.maxFeePercentage;
+  }
+
+  /// @notice Checks if an account is blacklisted
+  function isAccountBlacklisted(address account) external view returns (bool) {
+    return blacklistedAccounts[account];
+  }
+
+  /**
+   * @dev Get the contract version
+   * @return Version number
+   */
+  function version() external pure virtual returns (string memory) {
+    return "v2.2.2";
+  }
+
+  /// @notice Verifies that the protocol is not paused
+  ///
+  /// Aborts with:
+  /// - ProtocolPaused: If the protocol is paused.
+  function verifyProtocolNotPaused() external view {
+    if (protocolConfig.pause) revert ProtocolPaused();
+  }
+
+  /// @notice Verifies that an account is not blacklisted
+  /// @param account The account to verify
+  ///
+  /// Aborts with:
+  /// - Blacklisted: If the account is blacklisted.
+  function verifyAccountNotBlacklisted(address account) external view {
+    if (blacklistedAccounts[account]) revert Blacklisted();
+  }
+  /**
+   * @dev Function that authorizes an upgrade to a new implementation.
+   *      Authorization is handled by the onlyOwner modifier.
+   * @param newImplementation Address of the new implementation (unused, validated by UUPS)
+   */
+  function _authorizeUpgrade(address newImplementation) internal override onlyOwner {
+    // solhint-disable-next-line no-empty-blocks
+    // Authorization is handled by onlyOwner modifier; no additional logic needed
+  }
+}
